@@ -2,7 +2,17 @@ import { createFileRoute, useNavigate } from "@tanstack/react-router";
 import { useEffect, useMemo, useRef, useState, useCallback } from "react";
 import { supabase } from "@/integrations/supabase/client";
 import type { User } from "@supabase/supabase-js";
-import { LogOut, Search, Send, MessageCircle, Check, CheckCheck, UserPlus, X } from "lucide-react";
+import {
+  LogOut,
+  Search,
+  Send,
+  MessageCircle,
+  Check,
+  CheckCheck,
+  UserPlus,
+  X,
+  SmilePlus,
+} from "lucide-react";
 import { toast } from "sonner";
 
 export const Route = createFileRoute("/_authenticated/chat")({
@@ -27,16 +37,25 @@ type Message = {
   read_at: string | null;
 };
 
+type Reaction = {
+  id: string;
+  message_id: string;
+  user_id: string;
+  emoji: string;
+};
+
+const QUICK_EMOJIS = ["👍", "❤️", "😂", "😮", "😢", "🙏"];
+
 function ChatApp() {
   const navigate = useNavigate();
   const [me, setMe] = useState<User | null>(null);
   const [myProfile, setMyProfile] = useState<Profile | null>(null);
   const [contacts, setContacts] = useState<Profile[]>([]);
   const [messages, setMessages] = useState<Message[]>([]);
+  const [reactions, setReactions] = useState<Record<string, Reaction[]>>({});
   const [activeId, setActiveId] = useState<string | null>(null);
   const [showFind, setShowFind] = useState(false);
 
-  // Load user + profile
   useEffect(() => {
     supabase.auth.getUser().then(async ({ data }) => {
       if (!data.user) {
@@ -53,7 +72,6 @@ function ChatApp() {
     });
   }, [navigate]);
 
-  // Load conversations (people I've messaged with) + their profiles
   const loadContacts = useCallback(async (userId: string) => {
     const { data: msgs } = await supabase
       .from("messages")
@@ -81,18 +99,17 @@ function ChatApp() {
     if (me) loadContacts(me.id);
   }, [me, loadContacts]);
 
-  // Realtime: refresh contacts + messages when new message arrives
+  // Realtime: messages + reactions
   useEffect(() => {
     if (!me) return;
     const channel = supabase
-      .channel("messages-realtime")
+      .channel("inchat-realtime")
       .on(
         "postgres_changes",
         { event: "INSERT", schema: "public", table: "messages" },
         (payload) => {
           const m = payload.new as Message;
           if (m.sender_id !== me.id && m.recipient_id !== me.id) return;
-          // Append to active chat if relevant
           setMessages((cur) => {
             const other = activeId;
             const isCurrent =
@@ -114,6 +131,30 @@ function ChatApp() {
           setMessages((cur) => cur.map((x) => (x.id === m.id ? m : x)));
         },
       )
+      .on(
+        "postgres_changes",
+        { event: "INSERT", schema: "public", table: "message_reactions" },
+        (payload) => {
+          const r = payload.new as Reaction;
+          setReactions((cur) => {
+            const list = cur[r.message_id] ?? [];
+            if (list.some((x) => x.id === r.id)) return cur;
+            return { ...cur, [r.message_id]: [...list, r] };
+          });
+        },
+      )
+      .on(
+        "postgres_changes",
+        { event: "DELETE", schema: "public", table: "message_reactions" },
+        (payload) => {
+          const r = payload.old as Reaction;
+          setReactions((cur) => {
+            const list = cur[r.message_id];
+            if (!list) return cur;
+            return { ...cur, [r.message_id]: list.filter((x) => x.id !== r.id) };
+          });
+        },
+      )
       .subscribe();
     return () => {
       supabase.removeChannel(channel);
@@ -124,6 +165,7 @@ function ChatApp() {
   useEffect(() => {
     if (!me || !activeId) {
       setMessages([]);
+      setReactions({});
       return;
     }
     (async () => {
@@ -135,9 +177,28 @@ function ChatApp() {
         )
         .order("created_at", { ascending: true })
         .limit(500);
-      setMessages((data ?? []) as Message[]);
+      const msgs = (data ?? []) as Message[];
+      setMessages(msgs);
 
-      // mark received as read
+      // Load reactions for these messages
+      if (msgs.length > 0) {
+        const { data: rxs } = await supabase
+          .from("message_reactions")
+          .select("*")
+          .in(
+            "message_id",
+            msgs.map((m) => m.id),
+          );
+        const grouped: Record<string, Reaction[]> = {};
+        (rxs ?? []).forEach((r) => {
+          const rx = r as Reaction;
+          (grouped[rx.message_id] ||= []).push(rx);
+        });
+        setReactions(grouped);
+      } else {
+        setReactions({});
+      }
+
       await supabase
         .from("messages")
         .update({ read_at: new Date().toISOString() })
@@ -163,13 +224,46 @@ function ChatApp() {
     setShowFind(false);
   }
 
+  async function toggleReaction(messageId: string, emoji: string) {
+    if (!me) return;
+    const existing = (reactions[messageId] ?? []).find(
+      (r) => r.user_id === me.id && r.emoji === emoji,
+    );
+    if (existing) {
+      // optimistic remove
+      setReactions((cur) => ({
+        ...cur,
+        [messageId]: (cur[messageId] ?? []).filter((r) => r.id !== existing.id),
+      }));
+      const { error } = await supabase
+        .from("message_reactions")
+        .delete()
+        .eq("id", existing.id);
+      if (error) toast.error(error.message);
+    } else {
+      const { data, error } = await supabase
+        .from("message_reactions")
+        .insert({ message_id: messageId, user_id: me.id, emoji })
+        .select()
+        .single();
+      if (error) {
+        toast.error(error.message);
+        return;
+      }
+      setReactions((cur) => {
+        const list = cur[messageId] ?? [];
+        if (list.some((x) => x.id === (data as Reaction).id)) return cur;
+        return { ...cur, [messageId]: [...list, data as Reaction] };
+      });
+    }
+  }
+
   if (!me || !myProfile) {
     return <div className="flex h-screen items-center justify-center bg-background" />;
   }
 
   return (
     <div className="flex h-screen overflow-hidden bg-background">
-      {/* Sidebar */}
       <aside className="flex w-full flex-col border-r bg-panel md:w-[360px] md:min-w-[320px]">
         <div className="flex items-center justify-between bg-header px-4 py-3 text-header-foreground">
           <div className="flex items-center gap-3">
@@ -225,15 +319,16 @@ function ChatApp() {
         </div>
       </aside>
 
-      {/* Chat area */}
       <main className={`flex-1 flex-col ${activeId ? "flex" : "hidden md:flex"}`}>
         {activeProfile ? (
           <Conversation
             me={me}
             other={activeProfile}
             messages={messages}
+            reactions={reactions}
             onBack={() => setActiveId(null)}
             onSent={(m) => setMessages((cur) => [...cur, m])}
+            onToggleReaction={toggleReaction}
           />
         ) : (
           <EmptyState />
@@ -280,22 +375,40 @@ function Conversation({
   me,
   other,
   messages,
+  reactions,
   onBack,
   onSent,
+  onToggleReaction,
 }: {
   me: User;
   other: Profile;
   messages: Message[];
+  reactions: Record<string, Reaction[]>;
   onBack: () => void;
   onSent: (m: Message) => void;
+  onToggleReaction: (messageId: string, emoji: string) => void;
 }) {
   const [text, setText] = useState("");
   const [sending, setSending] = useState(false);
+  const [pickerFor, setPickerFor] = useState<string | null>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
     scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight });
   }, [messages.length]);
+
+  // Close picker on outside click / escape
+  useEffect(() => {
+    if (!pickerFor) return;
+    const onDown = () => setPickerFor(null);
+    const onKey = (e: KeyboardEvent) => e.key === "Escape" && setPickerFor(null);
+    window.addEventListener("mousedown", onDown);
+    window.addEventListener("keydown", onKey);
+    return () => {
+      window.removeEventListener("mousedown", onDown);
+      window.removeEventListener("keydown", onKey);
+    };
+  }, [pickerFor]);
 
   async function send(e: React.FormEvent) {
     e.preventDefault();
@@ -335,32 +448,112 @@ function Conversation({
             const mine = m.sender_id === me.id;
             const prev = messages[i - 1];
             const grouped = prev && prev.sender_id === m.sender_id;
+            const msgReactions = reactions[m.id] ?? [];
+            const grouping = groupReactions(msgReactions);
             return (
               <div
                 key={m.id}
-                className={`flex ${mine ? "justify-end" : "justify-start"} ${grouped ? "mt-0.5" : "mt-2"}`}
+                className={`group/msg relative flex ${mine ? "justify-end" : "justify-start"} ${
+                  grouped ? "mt-0.5" : "mt-2"
+                }`}
               >
-                <div
-                  className={`max-w-[78%] rounded-lg px-3 py-1.5 text-sm shadow-sm ${
-                    mine
-                      ? "bg-bubble-out text-bubble-out-foreground"
-                      : "bg-bubble-in text-bubble-in-foreground"
-                  }`}
-                >
-                  <div className="whitespace-pre-wrap break-words">{m.content}</div>
-                  <div className="mt-0.5 flex items-center justify-end gap-1 text-[10px] opacity-60">
-                    {new Date(m.created_at).toLocaleTimeString([], {
-                      hour: "2-digit",
-                      minute: "2-digit",
-                    })}
-                    {mine &&
-                      (m.read_at ? (
-                        <CheckCheck className="size-3 text-tick" />
-                      ) : (
-                        <Check className="size-3" />
-                      ))}
+                <div className={`flex max-w-[78%] items-end gap-1 ${mine ? "flex-row-reverse" : ""}`}>
+                  <div className="relative">
+                    <div
+                      className={`rounded-lg px-3 py-1.5 text-sm shadow-sm ${
+                        mine
+                          ? "bg-bubble-out text-bubble-out-foreground"
+                          : "bg-bubble-in text-bubble-in-foreground"
+                      }`}
+                    >
+                      <div className="whitespace-pre-wrap break-words">{m.content}</div>
+                      <div className="mt-0.5 flex items-center justify-end gap-1 text-[10px] opacity-60">
+                        {new Date(m.created_at).toLocaleTimeString([], {
+                          hour: "2-digit",
+                          minute: "2-digit",
+                        })}
+                        {mine &&
+                          (m.read_at ? (
+                            <CheckCheck className="size-3 text-tick" />
+                          ) : (
+                            <Check className="size-3" />
+                          ))}
+                      </div>
+                    </div>
+
+                    {grouping.length > 0 && (
+                      <div
+                        className={`-mt-1 flex flex-wrap gap-1 ${
+                          mine ? "justify-end" : "justify-start"
+                        } pl-1 pr-1`}
+                      >
+                        {grouping.map((g) => {
+                          const reacted = g.userIds.includes(me.id);
+                          return (
+                            <button
+                              key={g.emoji}
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                onToggleReaction(m.id, g.emoji);
+                              }}
+                              className={`flex items-center gap-0.5 rounded-full border bg-card px-1.5 py-0.5 text-xs shadow-sm transition hover:scale-105 ${
+                                reacted ? "border-primary bg-primary/10" : ""
+                              }`}
+                              title={reacted ? "Remove reaction" : "Add reaction"}
+                            >
+                              <span className="text-sm leading-none">{g.emoji}</span>
+                              {g.count > 1 && (
+                                <span className="text-[10px] font-medium text-muted-foreground">
+                                  {g.count}
+                                </span>
+                              )}
+                            </button>
+                          );
+                        })}
+                      </div>
+                    )}
                   </div>
+
+                  <button
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      setPickerFor(pickerFor === m.id ? null : m.id);
+                    }}
+                    className="mb-1 rounded-full bg-card p-1.5 text-muted-foreground opacity-0 shadow transition hover:text-foreground group-hover/msg:opacity-100"
+                    title="Add reaction"
+                  >
+                    <SmilePlus className="size-4" />
+                  </button>
                 </div>
+
+                {pickerFor === m.id && (
+                  <div
+                    onMouseDown={(e) => e.stopPropagation()}
+                    className={`absolute z-20 flex gap-1 rounded-full border bg-popover p-1.5 shadow-xl ${
+                      mine ? "right-12" : "left-12"
+                    } -top-9`}
+                  >
+                    {QUICK_EMOJIS.map((emoji) => {
+                      const reacted = (reactions[m.id] ?? []).some(
+                        (r) => r.user_id === me.id && r.emoji === emoji,
+                      );
+                      return (
+                        <button
+                          key={emoji}
+                          onClick={() => {
+                            onToggleReaction(m.id, emoji);
+                            setPickerFor(null);
+                          }}
+                          className={`flex size-8 items-center justify-center rounded-full text-lg transition hover:scale-125 ${
+                            reacted ? "bg-primary/15" : "hover:bg-accent"
+                          }`}
+                        >
+                          {emoji}
+                        </button>
+                      );
+                    })}
+                  </div>
+                )}
               </div>
             );
           })}
@@ -384,6 +577,20 @@ function Conversation({
       </form>
     </>
   );
+}
+
+function groupReactions(rxs: Reaction[]) {
+  const map = new Map<string, { emoji: string; count: number; userIds: string[] }>();
+  for (const r of rxs) {
+    const cur = map.get(r.emoji);
+    if (cur) {
+      cur.count += 1;
+      cur.userIds.push(r.user_id);
+    } else {
+      map.set(r.emoji, { emoji: r.emoji, count: 1, userIds: [r.user_id] });
+    }
+  }
+  return Array.from(map.values());
 }
 
 function EmptyState() {
@@ -480,7 +687,6 @@ function Avatar({ profile, size = 40 }: { profile: Profile; size?: number }) {
       />
     );
   }
-  // Deterministic hue from id
   const hash = Array.from(profile.id).reduce((a, c) => a + c.charCodeAt(0), 0);
   const hue = hash % 360;
   return (
